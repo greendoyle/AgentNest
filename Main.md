@@ -41,7 +41,7 @@
 ### 1.3 项目结构
 
 ```
-multi-agent-platform/
+AgentNest/
 ├── core/
 │   ├── __init__.py
 │   ├── agent.py          # ReAct Agent 核心循环
@@ -49,7 +49,8 @@ multi-agent-platform/
 │   └── tool.py           # Tool 基类 + 注册中心
 ├── tools/
 │   ├── __init__.py
-│   └── builtin.py        # 内置工具（计算器、时间查询、天气等）
+│   ├── builtin.py        # 内置工具（计算器、时间查询等）
+│   └── log.py            # 日志管理（WrapFormatter + get_logger）
 ├── config.py             # 配置管理
 ├── main.py               # 入口（交互式 CLI）
 └── requirements.txt      # 依赖
@@ -111,8 +112,8 @@ multi-agent-platform/
 
 1. 创建项目目录和虚拟环境：
    ```bash
-   mkdir -p multi-agent-platform
-   cd multi-agent-platform
+   mkdir -p AgentNest
+   cd AgentNest
    python -m venv .venv
    source .venv/bin/activate  # Windows: .venv\Scripts\activate
    ```
@@ -208,7 +209,78 @@ class ToolRegistry:
 
 > **验收点 1**：能创建 ToolRegistry，注册和查询工具。可以写一个简单的测试脚本验证。
 
-#### Step 4：实现内置工具 — `tools/builtin.py`
+#### Step 4：实现 log 日志管理模块 — `tools/log.py`
+
+实现 log 日志管理模块：
+
+```python
+import logging
+import os
+import textwrap
+from datetime import datetime
+
+
+class WrapFormatter(logging.Formatter):
+    """自定义 Formatter：自动对超长 message 进行折行处理"""
+
+    def __init__(self, fmt=None, datefmt=None, max_line_length=120, wrap_width=120):
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self.max_line_length = max_line_length
+        self.wrap_width = wrap_width
+
+    def format(self, record):
+        original_message = record.getMessage()
+        if len(original_message) > self.max_line_length:
+            record.msg = textwrap.fill(
+                original_message,
+                width=self.wrap_width,
+                subsequent_indent='             ',
+            )
+        return super().format(record)
+
+
+# Logger 采用单例模式：同一个名字返回同一个实例，避免重复添加 Handler
+def get_logger(name='app', log_dir='logs', level=logging.DEBUG):
+    """
+    创建并返回一个记录到文件的 Logger 实例。
+
+    参数:
+        name:   Logger 名称（通常用 __name__ 传入当前模块名）
+        log_dir: 日志文件存放目录
+        level:  日志级别（DEBUG / INFO / WARNING / ERROR / CRITICAL）
+    """
+    logger = logging.getLogger(name)
+
+    # 如果已存在 Handler，直接返回（防止重复添加）
+    if logger.handlers:
+        return logger
+
+    # 设置日志级别：低于该级别的日志将被忽略
+    logger.setLevel(level)
+
+    # 创建文件 Handler：将日志写入文件
+    os.makedirs(log_dir, exist_ok=True)
+    # 按日期生成日志文件名，例如 2026-04-24.log
+    log_file = os.path.join(log_dir, f'{datetime.now().strftime("%Y-%m-%d")}.log')
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(level)
+
+    # 创建格式化器：自定义折行格式，超过 300 字符自动换行
+    formatter = WrapFormatter(
+        fmt='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        max_line_length=300,
+        wrap_width=300,
+    )
+    file_handler.setFormatter(formatter)
+
+    # 将 Handler 绑定到 Logger
+    logger.addHandler(file_handler)
+
+    return logger
+```
+
+#### Step 5：实现内置工具 — `tools/builtin.py`
 
 实现几个简单的工具用于测试：
 
@@ -291,16 +363,17 @@ class CurrentTimeTool(Tool):
 
 > **验收点 2**：能实例化工具，调用 `execute()` 方法能正确返回结果。
 
-#### Step 5：实现 LLM API 封装 — `core/llm.py`
+#### Step 6：实现 LLM API 封装 — `core/llm.py`
 
 直接通过 HTTP 调用 LLM API（OpenAI 兼容接口）：
 
 ```python
 import json
-from typing import AsyncGenerator
 import httpx
 from config import API_KEY, BASE_URL, MODEL
+from tools.log import get_logger
 
+logger = get_logger(__name__)
 
 async def chat(
     messages: list[dict],
@@ -334,11 +407,17 @@ async def chat(
     if tools:
         payload["tools"] = tools
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         response = await client.post(BASE_URL, headers=headers, json=payload)
-        response.raise_for_status()
         data = response.json()
+        if response.status_code != 200:
+            return {
+                "content": "请求失败:" + data.get("error").get("message"),
+                "tool_calls": [],
+                "finish_reason": "error",
+            }
 
+    logger.debug(f"LLM 回复: {data}")
     choice = data["choices"][0]["message"]
     content = choice.get("content", "")
     finish_reason = data["choices"][0].get("finish_reason", "stop")
@@ -349,6 +428,7 @@ async def chat(
             tool_calls.append({
                 "name": tc["function"]["name"],
                 "arguments": json.loads(tc["function"]["arguments"]),
+                "id": tc.get("id", ""),
             })
 
     return {
@@ -360,15 +440,17 @@ async def chat(
 
 > **提示**：这里使用 OpenAI 兼容接口格式，如果你使用 DeepSeek、Claude 等，参数结构略有不同，但核心逻辑一致。
 
-#### Step 6：实现 ReAct Agent 核心 — `core/agent.py`
+#### Step 7：实现 ReAct Agent 核心 — `core/agent.py`
 
 这是 Phase 1 的核心——实现 ReAct 循环：
 
 ```python
 from core.llm import chat
 from core.tool import ToolRegistry
+from tools.log import get_logger
 
-SYSTEM_PROMPT = """\
+logger = get_logger(__name__)
+SYSTEM_PROMPT = """
 You are a helpful assistant that can use tools to solve user's problems.
 
 You must follow the ReAct (Reasoning + Acting) pattern:
@@ -377,16 +459,11 @@ You must follow the ReAct (Reasoning + Acting) pattern:
 3. Observe the tool's result (Observation:)
 4. Continue until you can give a final answer (Final Answer:)
 
-You have access to the following tools:
-{tools_description}
-
 Rules:
 - Always start with a Thought explaining your reasoning
 - Use tools when you need to compute, look up, or calculate something
 - Only call one tool at a time
 - When you have enough information, give the Final Answer directly
-- Format your response as JSON with "thought", "action", and "action_input" fields
-  OR format as {"final_answer": "your answer"} when done
 """
 
 
@@ -395,22 +472,18 @@ class Agent:
         self.tool_registry = tool_registry
         self.max_iterations = 10
 
-    def _build_system_prompt(self) -> str:
-        tools_desc = "\n".join(
-            f"- {tool.name}: {tool.description}"
-            for tool in self.tool_registry.list_tools()
-        )
-        return SYSTEM_PROMPT.format(tools_description=tools_desc)
-
     async def run(self, user_input: str) -> str:
         """执行 Agent 推理循环，返回最终答案"""
         messages = [
-            {"role": "system", "content": self._build_system_prompt()},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_input},
         ]
 
+        tools = self.tool_registry.get_openai_tools_schema()
+
         for iteration in range(self.max_iterations):
-            response = await chat(messages)
+            logger.debug(f"消息轮次： {iteration + 1}")
+            response = await chat(messages, tools)
 
             if response["tool_calls"]:
                 # LLM 要求调用工具
@@ -429,7 +502,7 @@ class Agent:
                     messages.append({
                         "role": "tool",
                         "content": result,
-                        "tool_call_id": tc.get("id", ""),
+                        "tool_call_id": tc["id"],
                     })
             else:
                 # LLM 直接回答，循环结束
@@ -440,16 +513,19 @@ class Agent:
 
 > **验收点 3**：能创建 Agent 实例，传入 tool_registry，调用 `agent.run("12乘以34等于几？")` 能正确调用计算器并返回结果。
 
-#### Step 7：实现 CLI 入口 — `main.py`
+#### Step 8：实现 CLI 入口 — `main.py`
 
 ```python
 import asyncio
 from core.agent import Agent
 from core.tool import ToolRegistry
 from tools.builtin import CalculatorTool, CurrentTimeTool
+from tools.log import get_logger
 
+logger = get_logger(__name__)
 
 async def main():
+    logger.info("程序启动")
     registry = ToolRegistry()
     registry.register(CalculatorTool())
     registry.register(CurrentTimeTool())
@@ -459,12 +535,15 @@ async def main():
     print("Agent 已启动！输入你的问题（输入 'quit' 退出）")
     while True:
         user_input = input("\n> ").strip()
+        logger.debug(f"用户输入: {user_input}")
         if user_input.lower() in ("quit", "exit", "q"):
+            logger.info("程序退出")
             break
         if not user_input:
             continue
 
         result = await agent.run(user_input)
+        logger.debug(f"Agent 输出: {result}")
         print(f"\n{result}")
 
 
@@ -527,7 +606,7 @@ _完成 Phase 1 后，进入 Phase 2：为 Agent 添加记忆能力。_
 在 Phase 1 基础上，新增 `memory/` 模块：
 
 ```
-multi-agent-platform/
+AgentNest/
 ├── core/
 │   ├── __init__.py
 │   ├── agent.py          # 改造：接入 MemoryManager
@@ -541,7 +620,8 @@ multi-agent-platform/
 │   └── summarizer.py     # 对话摘要生成
 ├── tools/
 │   ├── __init__.py
-│   └── builtin.py        # 不变
+│   ├── builtin.py        # 不变
+│   └── log.py            # 不变
 ├── data/                 # 【新增】Chroma 持久化目录（.gitignore）
 │   └── .gitkeep
 ├── config.py             # 新增：MEMORY_DIR、EMBEDDING_MODEL 等配置
@@ -1080,7 +1160,7 @@ _完成 Phase 2 后，进入 Phase 3：为 Agent 添加 RAG 知识库能力。_
 在 Phase 2 基础上，新增 `knowledge/` 模块和 `docs/` 目录：
 
 ```
-multi-agent-platform/
+AgentNest/
 ├── core/
 │   ├── __init__.py
 │   ├── agent.py          # 改造：注册知识库工具
@@ -1101,7 +1181,8 @@ multi-agent-platform/
 │   └── summarizer.py     # 不变
 ├── tools/
 │   ├── __init__.py
-│   └── builtin.py        # 不变
+│   ├── builtin.py        # 不变
+│   └── log.py            # 不变
 ├── data/
 │   └── memory/           # 不变
 ├── docs/                 # 【新增】存放待索引的文档（.gitignore）
@@ -1705,7 +1786,7 @@ _完成 Phase 3 后，进入 Phase 4：标准化 Skills 可插拔系统。_
 在 Phase 3 基础上，将 `tools/` 升级为 `skills/` 目录，并新增 `skills/` 模块核心文件：
 
 ```
-multi-agent-platform/
+AgentNest/
 ├── core/
 │   ├── __init__.py
 │   ├── agent.py          # 改造：使用 SkillsRegistry 替代 ToolRegistry
@@ -1722,6 +1803,9 @@ multi-agent-platform/
 │   ├── code_runner.py    # 【新增】代码执行 Skill（示例）
 │   ├── file_ops.py       # 【新增】文件操作 Skill（示例）
 │   └── chain.py          # Skill Chain：多技能顺序编排
+├── tools/
+│   ├── __init__.py
+│   └── log.py            # 不变
 ├── docs/                 # 不变
 ├── data/                 # 不变
 ├── config.py             # 不变
@@ -2665,11 +2749,12 @@ _完成 Phase 4 后，进入 Phase 5：多 Agent 协作。_
 新增 `multiagent/` 模块，包含多 Agent 协作的核心逻辑：
 
 ```
-multi-agent-platform/
+AgentNest/
 ├── core/               # 不变
 ├── knowledge/          # 不变
 ├── memory/             # 不变
 ├── skills/             # 不变
+├── tools/              # 不变
 ├── multiagent/         # 【新增】多 Agent 协作模块
 │   ├── __init__.py
 │   ├── message.py      # Agent 间消息定义
@@ -3444,7 +3529,7 @@ _完成 Phase 5 后，进入 Phase 6：性能优化与稳定性。_
 新增 `optimization/` 模块和 `session/` 模块：
 
 ```
-multi-agent-platform/
+AgentNest/
 ├── core/               # 不变
 ├── knowledge/          # 不变
 ├── memory/             # 改造：升级压缩逻辑
@@ -3458,6 +3543,7 @@ multi-agent-platform/
 ├── session/            # 【新增】会话管理
 │   ├── __init__.py
 │   └── manager.py      # 多会话管理器
+├── tools/              # 不变
 ├── docs/               # 不变
 ├── data/               # 不变
 ├── config.py           # 新增：CACHE_DIR、MAX_SESSIONS 等
