@@ -234,7 +234,7 @@ class WrapFormatter(logging.Formatter):
             record.msg = textwrap.fill(
                 original_message,
                 width=self.wrap_width,
-                subsequent_indent='             ',
+                subsequent_indent='                             ',
             )
         return super().format(record)
 

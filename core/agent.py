@@ -41,6 +41,7 @@ class Agent:
 
             if response["tool_calls"]:
                 # LLM 要求调用工具
+                logger.debug("工具调用:")
                 for tc in response["tool_calls"]:
                     tool = self.tool_registry.get(tc["name"])
                     if tool:
@@ -58,6 +59,9 @@ class Agent:
                         "content": result,
                         "tool_call_id": tc["id"],
                     })
+                    logger.debug(f"工具调用：Calling tool: {tc['name']} with args: {tc['arguments']}")
+                    logger.debug(f"调用结果：{result}")
+                logger.debug("工具调用结束")
             else:
                 # LLM 直接回答，循环结束
                 return response["content"]
